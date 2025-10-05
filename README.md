@@ -7,16 +7,7 @@ System wyświetla zsynchronizowaną sekwencję efektów świetlnych, sterowaną 
 
 Demo
 
-[Zobacz wideo demonstracyjne na YouTube]Window Light Show – ESP32 + WS2812
-
-Projekt interaktywnego podświetlenia okien w lokalu rozrywkowym, zrealizowany w oparciu o mikrokontroler ESP32 i taśmy adresowalnych LED WS2812.  
-System wyświetla zsynchronizowaną sekwencję efektów świetlnych, sterowaną jednym pinem kontrolnym i dostosowaną do układu okien (538 diod LED podzielonych na 10 bloków/okien).
-
----
-
-Demo
-
-[Zobacz wideo demonstracyjne na YouTube]([https://youtu.be/TU_WKLEP_TUTAJ_LINK](https://youtu.be/2D8CAHWLyEI))  
+[Zobacz wideo demonstracyjne na YouTube] https://youtu.be/2D8CAHWLyEI
 
 
 ---
