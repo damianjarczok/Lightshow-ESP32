@@ -1,0 +1,883 @@
+// Połączony Light Show - wszystkie efekty w sekwencji
+#include <FastLED.h>
+
+constexpr uint16_t NUM_LEDS = 538;
+constexpr uint8_t DATA_PIN = 13;
+constexpr uint8_t CONTROL_PIN = 27;
+
+// Ustawienia globalne
+constexpr unsigned long ACTIVATION_DELAY = 30000; // 30s
+constexpr uint8_t MAX_BRIGHTNESS = 120;
+
+CRGB leds[NUM_LEDS];
+
+// wspólny podział na bloki (używane przez wiele efektów)
+struct LedBlock { uint16_t start; uint16_t length; };
+constexpr LedBlock blocks[] = {
+  {0,55},{55,54},{109,55},{164,54},{218,53},
+  {271,55},{326,53},{379,53},{432,53},{485,53}
+};
+constexpr uint8_t NUM_BLOCKS = sizeof(blocks)/sizeof(blocks[0]);
+
+// -----------------------------------------------------------------------------
+// Sekwencer
+// -----------------------------------------------------------------------------
+enum SeqStage { ST_WPAD, ST_YELLOW, ST_RAINBOW, ST_PONG, ST_BATTERY };
+SeqStage seqStage = ST_WPAD;
+
+unsigned long stageStart = 0;
+bool showActive = false;
+bool ledsOn = false;
+bool lastSignalState = false;
+unsigned long stateChangeTime = 0;
+
+// konfiguracja wymagań sekwencji:
+constexpr uint8_t WPAD_CYCLES = 8;
+constexpr uint8_t YELLOW_CYCLES = 10;
+constexpr unsigned long RAINBOW_MS = 20000UL; // 20s
+constexpr unsigned long PONG_MS = 15000UL;
+constexpr uint8_t BATTERY_CYCLES = 8;
+
+// -----------------------------------------------------------------------------
+// WPADANIE / SPADANIE (z kolorami segmentów)
+// -----------------------------------------------------------------------------
+namespace Wpad {
+  enum Phase { IDLE, WPADANIE, SPADANIE };
+  Phase phase = IDLE;
+  unsigned long phaseStart = 0;
+
+  struct WpadState {
+    uint8_t stackedCount = 0;
+    bool inMotion = true;
+    unsigned long segStart = 0;
+    unsigned long perSegMs = 0;
+    unsigned long moveMs = 0;
+    unsigned long pauseMs = 0;
+  } wpad;
+
+  struct DropState {
+    int dropIndex = -1;
+    bool dropped[NUM_BLOCKS];
+    bool inMotion = true;
+    unsigned long segStart = 0;
+    unsigned long perSegMs = 0;
+    unsigned long moveMs = 0;
+    unsigned long pauseMs = 0;
+  } dropst;
+
+  // Kolory segmentów - jeszcze bardziej wyraziste
+  const CRGB segColors[4] = {
+    CRGB(255,  20,  90),
+    CRGB( 20, 100, 255),
+    CRGB( 60, 255,  30),
+    CRGB(180,  30, 255)
+  };
+
+  // parametry (dostosowane)
+  constexpr unsigned long PHASE_DURATION_MS = 1500UL;
+  constexpr unsigned long FRAME_MS = 20;
+
+  // dodatkowe timery/pauzy:
+  constexpr unsigned long HOLD_BETWEEN_WPAD_AND_SPAD = 20UL; // 20 ms pauzy pomiędzy wpadaniem a spadaniem
+  constexpr unsigned long HOLD_AFTER_ALL_DROPPED = 200UL;     // 200 ms czarny ekran po wszystkich spadłych
+
+  unsigned long stackFinishedAt = 0; // moment, gdy wpadanie skończyło się (dla pauzy)
+  unsigned long allDroppedAt = 0;    // moment gdy wszystkie spadły (dla czarnego ekranu)
+
+  inline float easeInQuad(float t){ return t * t; }
+
+  void startWpadanie(unsigned long now){
+    phase = WPADANIE;
+    phaseStart = now;
+    wpad.stackedCount = 0;
+    wpad.inMotion = true;
+    wpad.segStart = now;
+    const int n = NUM_BLOCKS;
+    wpad.perSegMs = PHASE_DURATION_MS / (unsigned long)n;
+    wpad.moveMs = (wpad.perSegMs * 85UL) / 100UL;
+    if(wpad.moveMs < 5) wpad.moveMs = 5;
+    wpad.pauseMs = wpad.perSegMs - wpad.moveMs;
+    stackFinishedAt = 0;
+    allDroppedAt = 0;
+    for (int i = 0; i < n; ++i) dropst.dropped[i] = false;
+  }
+
+  void startSpadanie(unsigned long now){
+    phase = SPADANIE;
+    phaseStart = now;
+    const int n = NUM_BLOCKS;
+    dropst.dropIndex = n - 1;
+    for(int i=0;i<n;i++) dropst.dropped[i]=false;
+    dropst.inMotion = true;
+    dropst.segStart = now;
+    dropst.perSegMs = PHASE_DURATION_MS / (unsigned long)n;
+    dropst.moveMs = (dropst.perSegMs * 85UL) / 100UL;
+    if(dropst.moveMs < 5) dropst.moveMs = 5;
+    dropst.pauseMs = dropst.perSegMs - dropst.moveMs;
+    stackFinishedAt = 0;
+    allDroppedAt = 0;
+  }
+
+  // rysowanie bloku z kolorem zależnym od indeksu
+  void drawBlockAt(int segStart, uint16_t length, int blockIdx) {
+    int visStart = segStart;
+    int visLen = (int)length;
+    if (visStart < 0) { visLen += visStart; visStart = 0; }
+    if (visStart >= (int)NUM_LEDS) return;
+    if (visStart + visLen > (int)NUM_LEDS) visLen = NUM_LEDS - visStart;
+    if (visLen > 0) {
+      CRGB color = segColors[blockIdx % 4];
+      fill_solid(leds + visStart, visLen, color);
+    }
+  }
+
+  // Funkcja uruchamia jedną iterację (frame) efektu.
+  // Zwraca true, jeśli zakończył się kompletny cykl wpadanie+spadanie.
+  bool runOnce(unsigned long now) {
+    const int numBlocks = NUM_BLOCKS;
+
+    if (phase == IDLE) {
+      startWpadanie(now);
+      return false;
+    }
+
+    // WPADANIE
+    if (phase == WPADANIE) {
+      if (wpad.stackedCount >= (uint8_t)numBlocks) {
+        // zamiast natychmiastowego startu spadania - dajemy krótką pauzę
+        if (stackFinishedAt == 0) {
+          stackFinishedAt = now; // zaczynamy odmierzać pauzę
+          // wyświetl w pełni złożone segmenty podczas pauzy
+          fill_solid(leds, NUM_LEDS, CRGB::Black);
+          for (int i = 0; i < numBlocks; ++i) drawBlockAt(blocks[i].start, blocks[i].length, i);
+          FastLED.show();
+          return false;
+        } else {
+          if (now - stackFinishedAt >= HOLD_BETWEEN_WPAD_AND_SPAD) {
+            stackFinishedAt = 0;
+            startSpadanie(now);
+            return false;
+          } else {
+            return false;
+          }
+        }
+      }
+
+      int blockIdx = numBlocks - 1 - (int)wpad.stackedCount;
+      int blockLen = blocks[blockIdx].length;
+      int startPosLED = - (int)blockLen - 4;
+      int endPosLED = (int)blocks[blockIdx].start;
+
+      if (wpad.inMotion) {
+        unsigned long dt = now - wpad.segStart;
+        float frac = (wpad.moveMs>0) ? min(1.0f, (float)dt / (float)wpad.moveMs) : 1.0f;
+        float eased = easeInQuad(frac);
+        int offset = (int)round(eased * float(endPosLED - startPosLED));
+        int segStart = startPosLED + offset;
+
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        for (int i = numBlocks - wpad.stackedCount; i < numBlocks; ++i)
+          drawBlockAt(blocks[i].start, blocks[i].length, i);
+
+        // wpadający blok (ma ten sam kolor co docelowy blok)
+        drawBlockAt(segStart, blockLen, blockIdx);
+        FastLED.show();
+
+        if (frac >= 1.0f) {
+          wpad.inMotion = false;
+          wpad.segStart = now;
+          wpad.stackedCount++;
+        }
+      } else {
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        for (int i = numBlocks - wpad.stackedCount; i < numBlocks; ++i)
+          drawBlockAt(blocks[i].start, blocks[i].length, i);
+        FastLED.show();
+
+        if (now - wpad.segStart >= wpad.pauseMs) {
+          wpad.inMotion = true;
+          wpad.segStart = now;
+        }
+      }
+      return false;
+    }
+
+    // SPADANIE
+    if (phase == SPADANIE) {
+      const int n = numBlocks;
+      bool allDropped = true;
+      for (int i = 0; i < n; ++i) if (!dropst.dropped[i]) { allDropped = false; break; }
+
+      if (allDropped) {
+        // ustawiamy allDroppedAt jeśli pierwszy raz
+        if (allDroppedAt == 0) {
+          allDroppedAt = now;
+          // krótki czarny ekran natychmiast
+          fill_solid(leds, NUM_LEDS, CRGB::Black);
+          FastLED.show();
+          return false;
+        } else {
+          if (now - allDroppedAt >= HOLD_AFTER_ALL_DROPPED) {
+            allDroppedAt = 0;
+            phase = IDLE;
+            return true; // sygnalizujemy zakończenie cyklu
+          } else {
+            return false;
+          }
+        }
+      }
+
+      while (dropst.dropIndex >= 0 && dropst.dropped[dropst.dropIndex]) dropst.dropIndex--;
+      if (dropst.dropIndex < 0) { FastLED.show(); return false; }
+
+      if (dropst.inMotion) {
+        unsigned long dt = now - dropst.segStart;
+        float frac = (dropst.moveMs>0) ? min(1.0f, (float)dt / (float)dropst.moveMs) : 1.0f;
+        float eased = easeInQuad(frac);
+        int targetOffset = NUM_LEDS - blocks[dropst.dropIndex].start;
+        int offset = (int)round(eased * (float)targetOffset);
+
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        for (int i = 0; i < n; ++i)
+          if (!dropst.dropped[i] && i != dropst.dropIndex)
+            drawBlockAt(blocks[i].start, blocks[i].length, i);
+
+        // spadające bloki (każdy zachowuje swój kolor)
+        for (int i = dropst.dropIndex; i < n; ++i)
+          if (!dropst.dropped[i])
+            drawBlockAt(blocks[i].start + offset, blocks[i].length, i);
+
+        FastLED.show();
+
+        if (frac >= 1.0f) {
+          dropst.dropped[dropst.dropIndex] = true;
+          dropst.inMotion = false;
+          dropst.segStart = now;
+          dropst.dropIndex--;
+        }
+      } else {
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        for (int i = 0; i < n; ++i)
+          if (!dropst.dropped[i])
+            drawBlockAt(blocks[i].start, blocks[i].length, i);
+        FastLED.show();
+
+        if (now - dropst.segStart >= dropst.pauseMs) {
+          dropst.inMotion = true;
+          dropst.segStart = now;
+        }
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  void reset() {
+    phase = IDLE;
+    stackFinishedAt = 0;
+    allDroppedAt = 0;
+  }
+}
+
+// ----------------------------------------------------------------------------- 
+// PRZELATUJĄCE ŻÓŁTE PASKI (adaptacja, z liczeniem cykli, o 4 cykle mniej)
+// -----------------------------------------------------------------------------
+namespace Yellow {
+  enum EffectPhase { PH_L2R, PH_L2R_FADE, PH_R2L, PH_R2L_FADE, PH_CENTER_OUT, PH_CENTER_FADE };
+  EffectPhase phase = PH_L2R;
+
+  constexpr uint16_t FRAME_MS = 1;
+  constexpr unsigned long FADE_MS = 30;
+  constexpr unsigned long CENTER_FADE_MS = 800;
+  constexpr int BAR_WIDTH = 480;
+  constexpr int CENTER_BAR_MULT = 2;
+  constexpr int STEP = 16;
+  constexpr int TAIL = 12;
+
+  int headPos = -BAR_WIDTH;
+  int centerLeft = (NUM_LEDS - 1) / 2;
+  int centerRight = NUM_LEDS / 2;
+  int centerRadius = 0;
+  unsigned long fadeStart = 0;
+  unsigned long lastStep = 0;
+
+  int completedCycles = 0;
+
+  // maksymalna jasność żółtego efektu (0..255)
+  constexpr uint8_t YELLOW_PEAK = 150;
+
+  // -- nowe pola do skalowania liczby cykli --
+  static float accumScaled = 0.0f; // akumulator skalowany (float)
+  // Jeżeli YELLOW_CYCLES jest globalne (tak jak w Twoim kodzie), to:
+  // desiredCycles = YELLOW_CYCLES - 4 (ale co najmniej 1)
+  inline int desiredCycles() {
+    int desired = (int)YELLOW_CYCLES - 4;
+    if (desired < 1) desired = 1;
+    return desired;
+  }
+  inline float ratioScale() {
+    return (float)YELLOW_CYCLES / (float)desiredCycles();
+  }
+  // ------------------------------------------
+
+  // teraz setYellowAt skaluje wartość 'v' (0..255) do zakresu 0..YELLOW_PEAK
+  inline void setYellowAt(int i, uint8_t v) {
+    if (i < 0 || i >= (int)NUM_LEDS) return;
+    float factor = (float)v / 255.0f;                  // 0..1
+    uint8_t r = (uint8_t) constrain(round(factor * (float)YELLOW_PEAK), 0, (int)YELLOW_PEAK);
+    uint8_t g = (uint8_t) constrain(round(factor * (float)YELLOW_PEAK * 0.8f), 0, (int)YELLOW_PEAK);
+    uint8_t b = (uint8_t) constrain(round(factor * (float)YELLOW_PEAK * 0.05f), 0, (int)YELLOW_PEAK);
+    leds[i] = CRGB(r, g, b);
+  }
+
+  inline void clearAll() { fill_solid(leds, NUM_LEDS, CRGB::Black); }
+
+  inline float distFromCenterFloat(int idx) {
+    const float centerPos = ((float)centerLeft + (float)centerRight) * 0.5f;
+    return fabsf((float)idx - centerPos);
+  }
+
+  void drawPassLH(int head, int width, float globalFade = 1.0f) {
+    clearAll();
+    for (int i = 0; i < NUM_LEDS; ++i) {
+      float d = (float)head - (float)i;
+      if (d >= 0.0f && d < (float)width) {
+        float frac = 1.0f - (d / (float)width);
+        float intensity = frac * frac * globalFade;
+        uint8_t v = (uint8_t) constrain(round(intensity * 255.0f), 0, 255);
+        setYellowAt(i, v);
+      }
+    }
+  }
+
+  void drawPassRH(int head, int width, float globalFade = 1.0f) {
+    clearAll();
+    for (int i = 0; i < NUM_LEDS; ++i) {
+      float d = (float)i - (float)head;
+      if (d >= 0.0f && d < (float)width) {
+        float frac = 1.0f - (d / (float)width);
+        float intensity = frac * frac * globalFade;
+        uint8_t v = (uint8_t) constrain(round(intensity * 255.0f), 0, 255);
+        setYellowAt(i, v);
+      }
+    }
+  }
+
+  void drawCenterOutWave(int centerRadiusLocal) {
+    clearAll();
+    if (centerRadiusLocal <= 0) return;
+
+    const float maxRadius = (float)(NUM_LEDS / 2) * (float)CENTER_BAR_MULT;
+    if ((float)centerRadiusLocal > maxRadius) centerRadiusLocal = (int)maxRadius;
+
+    for (int i = 0; i < NUM_LEDS; ++i) {
+      float dist = distFromCenterFloat(i);
+      if (dist <= (float)centerRadiusLocal - (float)TAIL) {
+        setYellowAt(i, 255);
+      } else if (dist <= (float)centerRadiusLocal) {
+        float t = (centerRadiusLocal - dist) / (float)TAIL;
+        t = constrain(t, 0.0f, 1.0f);
+        uint8_t v = (uint8_t)(t * 255.0f);
+        setYellowAt(i, v);
+      }
+    }
+  }
+
+  void drawCenterOffWave(float offRadius) {
+    clearAll();
+    if (offRadius <= 0.0f) {
+      for (int i = 0; i < NUM_LEDS; ++i) setYellowAt(i, 255);
+      return;
+    }
+
+    const float maxRadius = (float)(NUM_LEDS / 2) * (float)CENTER_BAR_MULT;
+    if (offRadius > maxRadius) offRadius = maxRadius;
+
+    for (int i = 0; i < NUM_LEDS; ++i) {
+      float dist = distFromCenterFloat(i);
+      if (dist <= offRadius - (float)TAIL) {
+        // off
+      } else if (dist <= offRadius) {
+        float t = (offRadius - dist) / (float)TAIL;
+        t = constrain(t, 0.0f, 1.0f);
+        uint8_t v = (uint8_t)(t * 255.0f);
+        setYellowAt(i, v);
+      } else {
+        setYellowAt(i, 255);
+      }
+    }
+  }
+
+  // Uruchamiaj w loop() — zwraca true gdy ukończono jeden pełen cykl (powrót do PH_L2R)
+  bool runOnce(unsigned long now) {
+    if (now - lastStep < FRAME_MS) return false;
+    lastStep = now;
+
+    switch (phase) {
+      case PH_L2R:
+        drawPassLH(headPos, BAR_WIDTH);
+        FastLED.show();
+        headPos += STEP;
+        if (headPos > NUM_LEDS + BAR_WIDTH) {
+          phase = PH_L2R_FADE;
+          fadeStart = now;
+        }
+        break;
+
+      case PH_L2R_FADE: {
+        float g = 1.0f - (float)(now - fadeStart) / (float)FADE_MS;
+        g = constrain(g, 0.0f, 1.0f);
+        drawPassLH(headPos - STEP, BAR_WIDTH, g);
+        FastLED.show();
+        if (g <= 0.0f) {
+          phase = PH_R2L;
+          headPos = NUM_LEDS + BAR_WIDTH;
+        }
+        break;
+      }
+
+      case PH_R2L:
+        drawPassRH(headPos, BAR_WIDTH);
+        FastLED.show();
+        headPos -= STEP;
+        if (headPos < -BAR_WIDTH) {
+          phase = PH_R2L_FADE;
+          fadeStart = now;
+        }
+        break;
+
+      case PH_R2L_FADE: {
+        float g = 1.0f - (float)(now - fadeStart) / (float)FADE_MS;
+        g = constrain(g, 0.0f, 1.0f);
+        drawPassRH(headPos + STEP, BAR_WIDTH, g);
+        FastLED.show();
+        if (g <= 0.0f) {
+          phase = PH_CENTER_OUT;
+          centerRadius = 0;
+        }
+        break;
+      }
+
+      case PH_CENTER_OUT:
+        drawCenterOutWave(centerRadius);
+        FastLED.show();
+        centerRadius += STEP;
+        if (centerRadius >= (NUM_LEDS / 2) * CENTER_BAR_MULT) {
+          centerRadius = (NUM_LEDS / 2) * CENTER_BAR_MULT;
+          phase = PH_CENTER_FADE;
+          fadeStart = now;
+        }
+        break;
+
+      case PH_CENTER_FADE: {
+        float offFrac = (float)(now - fadeStart) / (float)CENTER_FADE_MS;
+        offFrac = constrain(offFrac, 0.0f, 1.0f);
+        float offRadius = offFrac * (NUM_LEDS / 2) * CENTER_BAR_MULT;
+        drawCenterOffWave(offRadius);
+        FastLED.show();
+        if (offFrac >= 1.0f) {
+          // cykl zakończony -> wracamy do PH_L2R i sygnalizujemy zakończenie jednego cyklu
+          phase = PH_L2R;
+          headPos = -BAR_WIDTH;
+          centerRadius = 0;
+
+          // zamiast prostego +1, używamy skalowanego akumulatora,
+          // aby efektowo wykonać YELLOW_CYCLES - 4 realnych cykli.
+          float r = ratioScale();        // jak bardzo "przyspieszyć" liczenie
+          accumScaled += r;             // dodajemy skalę
+          // completedCycles = zaokrąglony akumulator (stabilna konwersja)
+          completedCycles = (int) floor(accumScaled + 0.5f);
+
+          return true;
+        }
+        break;
+      }
+    }
+    return false;
+  }
+
+  void reset() {
+    phase = PH_L2R;
+    headPos = -BAR_WIDTH;
+    centerRadius = 0;
+    fadeStart = 0;
+    lastStep = 0;
+    completedCycles = 0;
+    accumScaled = 0.0f;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// TĘCZA (wszystkie LED jako jeden pasek; fade in/out: last->first; 1200ms fade)
+// -----------------------------------------------------------------------------
+namespace Rainbow {
+  constexpr uint8_t MAX_BRIGHT = 160; // full brightness during main
+  constexpr uint16_t FRAME_MS = 16;
+  constexpr uint8_t STRIPE_WIDTH = 10;
+  constexpr uint8_t HUE_STEP = 6;
+  constexpr float SPEED_MULT = 0.35f;
+
+  unsigned long lastFrame = 0;
+
+  // parametry entry/exit (ms) — ustawione na 1200 ms zgodnie z prośbą
+  constexpr unsigned long RAINBOW_ENTRY_MS = 1200UL; // fade in duration
+  constexpr unsigned long RAINBOW_EXIT_MS  = 1200UL; // fade out duration
+
+  // per-LED fade time (we'll clamp to max 200ms to keep each LED smoothing visible)
+  constexpr unsigned long PER_LED_FADE_MS_CAP = 200UL;
+
+  void runOnce(unsigned long now) {
+    if (now - lastFrame < FRAME_MS) return;
+    lastFrame = now;
+
+    // elapsed time since start of this stage
+    unsigned long t = (now >= stageStart) ? (now - stageStart) : 0UL;
+    unsigned long total = RAINBOW_MS;
+    if (t > total) t = total;
+
+    // Podział czasu: entry, main, exit
+    unsigned long entryDur = RAINBOW_ENTRY_MS;
+    unsigned long exitDur  = RAINBOW_EXIT_MS;
+    unsigned long mainDur  = (total > entryDur + exitDur) ? (total - entryDur - exitDur) : 0UL;
+
+    // szybkość "przesuwania" tęczy (offset) - animacja działa również w entry/exit
+    uint8_t timeOffset = (uint8_t)((now * SPEED_MULT));
+
+    // oblicz per-LED fade (zabezpieczamy cap 200ms)
+    unsigned long perLedFade = (entryDur < PER_LED_FADE_MS_CAP) ? entryDur : PER_LED_FADE_MS_CAP;
+
+    // spacing: zaplanuj start times tak, żeby ostatnia dioda kończyła fade dokładnie w entryDur
+    // startAt = orderPos * (entryDur - perLedFade) / (NUM_LEDS - 1)
+    float entrySpanDen = (float)max(1, (int)(NUM_LEDS - 1));
+    float entrySpanMul = (float)(entryDur > perLedFade ? (entryDur - perLedFade) : 0UL) / entrySpanDen;
+
+    // analogicznie dla exit: startOff = orderPos * (exitDur - perLedFade) / (NUM_LEDS - 1)
+    float exitSpanMul = (float)(exitDur > perLedFade ? (exitDur - perLedFade) : 0UL) / entrySpanDen;
+
+    for (int i = 0; i < (int)NUM_LEDS; ++i) {
+      // orderPos: 0 -> last LED (NUM_LEDS-1), NUM_LEDS-1 -> first LED (0)
+      int orderPos = (NUM_LEDS - 1) - i;
+      float alpha = 1.0f;
+
+      if (t < entryDur) {
+        // ENTRY: rozjaśnianie od last -> first
+        float startAt = (float)orderPos * entrySpanMul; // ms
+        if ((float)t <= startAt) {
+          alpha = 0.0f;
+        } else {
+          float dt = (float)t - startAt;
+          alpha = constrain(dt / (float)perLedFade, 0.0f, 1.0f);
+        }
+      } else if (t < entryDur + mainDur) {
+        // MAIN: pełna jasność
+        alpha = 1.0f;
+      } else {
+        // EXIT: ściemnianie od last -> first
+        float exitT = (float)(t - (entryDur + mainDur));
+        float startOff = (float)orderPos * exitSpanMul;
+        if (exitT <= startOff) {
+          alpha = 1.0f;
+        } else {
+          float dt = exitT - startOff;
+          alpha = 1.0f - constrain(dt / (float)perLedFade, 0.0f, 1.0f);
+        }
+      }
+
+      if (alpha <= 0.001f) {
+        leds[i] = CRGB::Black;
+      } else {
+        // wylicz kolor tęczy dla tej pozycji (używamy pozycji fizycznej, by paski były równe)
+        uint16_t stripeIndex = (i / STRIPE_WIDTH);
+        uint8_t hue = (uint8_t)(stripeIndex * HUE_STEP + timeOffset);
+        uint8_t value = (uint8_t) constrain(round(alpha * (float)MAX_BRIGHT), 0, 255);
+        leds[i] = CHSV(hue, 255, value);
+      }
+    }
+
+    FastLED.show();
+  }
+
+  void reset() { lastFrame = 0; }
+}
+
+// -----------------------------------------------------------------------------
+// PONG
+// -----------------------------------------------------------------------------
+namespace Pong {
+  constexpr uint16_t FRAME_MS = 15;
+  unsigned long lastFrame = 0;
+
+  struct PongBall {
+    float pos;
+    float speed;
+    int dir;
+    CRGB color;
+  };
+  PongBall balls[3];
+
+  void initPong() {
+    balls[0] = {0.0f, 3.0f + random(-10, 11) * 0.1f, 1, CRGB::Red};
+    balls[1] = {5.0f, 5.5f + random(-10, 11) * 0.1f, 1, CRGB::Green};
+    balls[2] = {9.0f, 8.0f + random(-10, 11) * 0.1f, -1, CRGB::Blue};
+  }
+
+  void runOnce(unsigned long now) {
+    if (now - lastFrame < FRAME_MS) return;
+    float deltaSec = (now - lastFrame) / 1000.0f;
+    lastFrame = now;
+
+    const uint8_t N = 3;
+    float oldPos[N];
+    float newPos[N];
+    float vel[N];
+
+    for (uint8_t i = 0; i < N; ++i) {
+      oldPos[i] = balls[i].pos;
+      vel[i] = balls[i].speed * (float)balls[i].dir;
+      newPos[i] = oldPos[i] + vel[i] * deltaSec;
+    }
+
+    for (uint8_t i = 0; i < N; ++i) {
+      if (newPos[i] < 0.0f) { newPos[i] = 0.0f; vel[i] = fabs(vel[i]); }
+      else if (newPos[i] > 9.0f) { newPos[i] = 9.0f; vel[i] = -fabs(vel[i]); }
+    }
+
+    const float COLLISION_THRESHOLD = 0.65f;
+
+    for (uint8_t i = 0; i < N; ++i) {
+      for (uint8_t j = i + 1; j < N; ++j) {
+        bool closeNow = fabs(newPos[i] - newPos[j]) < COLLISION_THRESHOLD;
+        bool crossed = (oldPos[i] < oldPos[j] && newPos[i] >= newPos[j]) ||
+                       (oldPos[i] > oldPos[j] && newPos[i] <= newPos[j]);
+        if (closeNow || crossed) {
+          float tmp = vel[i];
+          vel[i] = vel[j];
+          vel[j] = tmp;
+          float mid = (newPos[i] + newPos[j]) * 0.5f;
+          float sep = COLLISION_THRESHOLD * 0.5f;
+          newPos[i] = mid - sep;
+          newPos[j] = mid + sep;
+          newPos[i] += random(-3, 4) * 0.02f;
+          newPos[j] += random(-3, 4) * 0.02f;
+          if (newPos[i] < 0.0f) newPos[i] = 0.0f;
+          if (newPos[j] > 9.0f) newPos[j] = 9.0f;
+        }
+      }
+    }
+
+    for (uint8_t i = 0; i < N; ++i) {
+      balls[i].pos = newPos[i];
+      if (vel[i] >= 0.0f) { balls[i].dir = 1; balls[i].speed = vel[i]; }
+      else { balls[i].dir = -1; balls[i].speed = -vel[i]; }
+      if (balls[i].speed < 0.05f) balls[i].speed = 0.05f;
+      if (balls[i].speed > 10.0f) balls[i].speed = 10.0f;
+    }
+
+    for (uint8_t s = 0; s < NUM_BLOCKS; ++s)
+      fill_solid(leds + blocks[s].start, blocks[s].length, CRGB::Black);
+
+    for (uint8_t i = 0; i < N; ++i) {
+      int seg = (int)round(balls[i].pos);
+      seg = constrain(seg, 0, (int)NUM_BLOCKS - 1);
+      fill_solid(leds + blocks[seg].start, blocks[seg].length, balls[i].color);
+    }
+    FastLED.show();
+  }
+
+  void reset() { lastFrame = 0; initPong(); }
+}
+
+// -----------------------------------------------------------------------------
+// Ładowanie baterii
+// -----------------------------------------------------------------------------
+namespace Battery {
+  constexpr uint8_t BRIGHT = 200;
+  constexpr uint16_t FRAME_MS = 15;
+
+  unsigned long lastFrame = 0;
+  // parametry z oryginalnego efektu
+  const uint8_t segmentDelay = 110;     // ms między zapaleniem segmentów
+  const uint16_t pulseDuration = 300;   // czas trwania jednego pulsu PWM
+  const uint8_t pulseCount = 2;         // ile razy pulsują po zapaleniu
+  const uint16_t holdAfterPulse = 200;  // ms po pulsach zanim zgasną
+
+  unsigned long cycleTime = 0;
+  unsigned long lastCycleIndex = 0;
+  int completedCycles = 0;
+
+  void init() {
+    cycleTime = 10UL * segmentDelay + pulseCount * (unsigned long)pulseDuration + holdAfterPulse;
+    lastFrame = 0;
+    lastCycleIndex = 0;
+    completedCycles = 0;
+  }
+
+  // runOnce(t) - rysuje stan na podstawie czasu t (ms od początku etapu)
+  // zwraca true gdy wykryje zakończenie jednego cyklu
+  bool runOnce(unsigned long t) {
+    if (t - lastFrame < FRAME_MS) return false;
+    lastFrame = t;
+
+    unsigned long cyclePos = t % cycleTime;
+    unsigned long cycleIdx = t / cycleTime;
+
+    // Zapalanie segmentów po kolei
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    uint8_t litSegments = min(uint8_t(cyclePos / segmentDelay), uint8_t(10));
+
+    for(uint8_t i=0;i<litSegments;i++){
+      fill_solid(leds + blocks[i].start, blocks[i].length, CHSV(96,255,100));
+    }
+
+    if(litSegments == 10){
+      unsigned long pulseTime = cyclePos - 10*segmentDelay;
+      if(pulseTime < pulseCount*(unsigned long)pulseDuration){
+        unsigned long pulsePhase = pulseTime % pulseDuration;
+        float progress = float(pulsePhase) / float(pulseDuration);
+        uint8_t brightness = 120 + (uint8_t)(120.0f * sin(progress * PI));
+        for(uint8_t i=0;i<10;i++){
+          fill_solid(leds + blocks[i].start, blocks[i].length, CHSV(96,255,brightness));
+        }
+      } else if(pulseTime < pulseCount*(unsigned long)pulseDuration + holdAfterPulse){
+        for(uint8_t i=0;i<10;i++){
+          fill_solid(leds + blocks[i].start, blocks[i].length, CHSV(96,255,100));
+        }
+      }
+    }
+
+    FastLED.show();
+
+    if (cycleIdx != lastCycleIndex) {
+      lastCycleIndex = cycleIdx;
+      completedCycles++;
+      return true;
+    }
+    return false;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Inicjalizacja / setup
+// -----------------------------------------------------------------------------
+void setup() {
+  FastLED.addLeds<WS2812, DATA_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(MAX_BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
+
+  pinMode(CONTROL_PIN, INPUT);
+  lastSignalState = digitalRead(CONTROL_PIN) == HIGH;
+  stateChangeTime = millis();
+
+  // resety efektów
+  Wpad::reset();
+  Yellow::reset();
+  Rainbow::reset();
+  Pong::reset();
+  Battery::init();
+}
+
+// -----------------------------------------------------------------------------
+// Główna pętla: steruje sekwencją
+// -----------------------------------------------------------------------------
+void advanceStage(SeqStage next, unsigned long now) {
+  seqStage = next;
+  stageStart = now;
+  // reset efektu startującego
+  switch (seqStage) {
+    case ST_WPAD: Wpad::reset(); break;
+    case ST_YELLOW: Yellow::reset(); break;
+    case ST_RAINBOW: Rainbow::reset(); break;
+    case ST_PONG: Pong::reset(); break;
+    case ST_BATTERY: Battery::init(); break;
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+  bool signalHigh = digitalRead(CONTROL_PIN) == HIGH;
+
+  if (signalHigh != lastSignalState) {
+    stateChangeTime = now;
+    lastSignalState = signalHigh;
+  }
+
+  if ((now - stateChangeTime >= ACTIVATION_DELAY) && (ledsOn != signalHigh)) {
+    ledsOn = signalHigh;
+    if (ledsOn) {
+      showActive = true;
+      stageStart = now;
+      // zaczynamy od pierwszego etapu
+      advanceStage(ST_WPAD, now);
+      // reset liczników etapów
+      Yellow::completedCycles = 0;
+      Wpad::wpad.stackedCount = 0;
+      Battery::completedCycles = 0;
+      Pong::initPong();
+    } else {
+      showActive = false;
+      FastLED.clear();
+      FastLED.show();
+    }
+  }
+
+  if (!showActive) return;
+
+  // Uruchamiaj odpowiedni efekt w zależności od aktualnego etapu
+  switch (seqStage) {
+    case ST_WPAD: {
+      // wykonujemy powtarzanie cykli; liczymy zakończenia z Wpad::runOnce()
+      bool finishedCycle = Wpad::runOnce(now);
+      static uint8_t wpadCyclesDone = 0;
+      if (finishedCycle) {
+        wpadCyclesDone++;
+      }
+      // jeśli osiągnięto wymaganą ilość cykli -> przejdź dalej
+      if (wpadCyclesDone >= WPAD_CYCLES) {
+        wpadCyclesDone = 0;
+        advanceStage(ST_YELLOW, now);
+      }
+      break;
+    }
+
+    case ST_YELLOW: {
+      bool oneCycleDone = Yellow::runOnce(now);
+      if (oneCycleDone) {
+        if (Yellow::completedCycles >= YELLOW_CYCLES) {
+          Yellow::completedCycles = 0;
+          advanceStage(ST_RAINBOW, now);
+        }
+      }
+      break;
+    }
+
+    case ST_RAINBOW: {
+      Rainbow::runOnce(now);
+      if (now - stageStart >= RAINBOW_MS) {
+        advanceStage(ST_PONG, now);
+      }
+      break;
+    }
+
+    case ST_PONG: {
+      Pong::runOnce(now);
+      if (now - stageStart >= PONG_MS) {
+        advanceStage(ST_BATTERY, now);
+      }
+      break;
+    }
+
+    case ST_BATTERY: {
+      unsigned long t = now - stageStart;
+      bool cycleFinished = Battery::runOnce(t);
+      static uint8_t batCycles = 0;
+      if (cycleFinished) batCycles++;
+      if (batCycles >= BATTERY_CYCLES) {
+        batCycles = 0;
+        advanceStage(ST_WPAD, now); // całość startuje od nowa
+      }
+      break;
+    }
+  }
+}
