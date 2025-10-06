@@ -29,7 +29,6 @@ Logika sterowania
 System działa w trybie sekwencyjnym – wszystkie efekty uruchamiane są po sobie w pętli:
 
 
-
 ---
 
 Funkcje i efekty
